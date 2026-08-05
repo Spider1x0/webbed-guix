@@ -1,0 +1,7 @@
+# SDD scratch workspace (ledgers, briefs, review packages)
+.superpowers/
+
+# Guix build/eval artifacts
+*.drv
+result
+result-*
