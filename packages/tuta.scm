@@ -103,14 +103,19 @@
                 (skip-inputs '("source" "squashfs-tools" "patchelf" "bash-minimal"))
                 (rpath
                  (string-join
-                  (filter-map
+                  (append-map
                    (lambda (entry)
                      (let* ((iname (car entry))
-                            (ipath (cdr entry))
-                            (lib   (string-append ipath "/lib")))
-                       (and (not (member iname skip-inputs))
-                            (file-exists? lib)
-                            lib)))
+                            (ipath (cdr entry)))
+                       (if (member iname skip-inputs)
+                           '()
+                           ;; Include "/lib" and "/lib/nss": Guix's nss ships its
+                           ;; libraries (libnss3.so, libsmime3.so, ...) under
+                           ;; "lib/nss", not "lib", so the plain "/lib" entry is
+                           ;; not enough for the bundled Electron to find them.
+                           (filter file-exists?
+                                   (list (string-append ipath "/lib")
+                                         (string-append ipath "/lib/nss"))))))
                    %build-inputs)
                   ":")))
 
@@ -168,15 +173,24 @@
                 (when (elf-file? f)
                   (format #t "Patching ELF: ~a~%" f)
                   (invoke patchelf "--set-interpreter" loader f)
-                  (invoke patchelf "--set-rpath" rpath f)))
+                  ;; "$ORIGIN" (the ELF's own directory) MUST come first so the
+                  ;; binary still finds its bundled sibling libraries
+                  ;; (libffmpeg.so, libEGL.so, libGLESv2.so, libvk_swiftshader.so,
+                  ;; libvulkan.so.1) which live next to it in share/tuta.  Without
+                  ;; it, --set-rpath drops the upstream $ORIGIN entry and Electron
+                  ;; aborts with "libffmpeg.so: cannot open shared object file".
+                  (invoke patchelf "--set-rpath"
+                          (string-append "$ORIGIN:" rpath) f)))
               top-level-execs)
 
-             ;; Write launcher script
+             ;; Write launcher script.  LD_LIBRARY_PATH lists the Guix libs and
+             ;; the app dir (share) so any runtime dlopen of a bundled lib also
+             ;; resolves; the binary's own $ORIGIN RPATH is the primary path.
              (let ((launcher (string-append bin "/tuta")))
                (call-with-output-file launcher
                  (lambda (p)
                    (format p "#!~a~%export LD_LIBRARY_PATH=\"~a${LD_LIBRARY_PATH:+:}$LD_LIBRARY_PATH\"~%exec \"~a\" \"$@\"~%"
-                           bash rpath elf-binary)))
+                           bash (string-append share ":" rpath) elf-binary)))
                (chmod launcher #o755))
 
              ;; Install .desktop file
@@ -222,6 +236,7 @@
            libxkbcommon
            libxshmfence
            alsa-lib
+           eudev                          ; libudev.so.1 (Chromium dlopens it)
            libdrm
            libsecret
            libnotify
