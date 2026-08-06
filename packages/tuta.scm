@@ -186,10 +186,16 @@
              ;; Write launcher script.  LD_LIBRARY_PATH lists the Guix libs and
              ;; the app dir (share) so any runtime dlopen of a bundled lib also
              ;; resolves; the binary's own $ORIGIN RPATH is the primary path.
+             ;; FONTCONFIG_PATH points the bundled Chromium's fontconfig at a
+             ;; fonts.conf; without one it logs "Cannot load default config
+             ;; file" and renders no fonts.  The config's location varies:
+             ;; /etc/fonts on a full Guix System, or the user/system profile's
+             ;; etc/fonts otherwise (the profile copy also aggregates installed
+             ;; fonts).  Probe for the first that exists; respect an existing value.
              (let ((launcher (string-append bin "/tuta")))
                (call-with-output-file launcher
                  (lambda (p)
-                   (format p "#!~a~%export LD_LIBRARY_PATH=\"~a${LD_LIBRARY_PATH:+:}$LD_LIBRARY_PATH\"~%exec \"~a\" \"$@\"~%"
+                   (format p "#!~a~%export LD_LIBRARY_PATH=\"~a${LD_LIBRARY_PATH:+:}$LD_LIBRARY_PATH\"~%if [ -z \"$FONTCONFIG_PATH\" ]; then for d in /etc/fonts \"$HOME/.guix-profile/etc/fonts\" /run/current-system/profile/etc/fonts; do [ -f \"$d/fonts.conf\" ] && export FONTCONFIG_PATH=\"$d\" && break; done; fi~%exec \"~a\" \"$@\"~%"
                            bash (string-append share ":" rpath) elf-binary)))
                (chmod launcher #o755))
 
