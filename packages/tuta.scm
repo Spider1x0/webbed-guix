@@ -71,6 +71,19 @@
              (close-port port)
              (+ e-shoff (* e-shnum e-shentsz))))
 
+         ;; True if PATH begins with the ELF magic (0x7f 'E' 'L' 'F').
+         ;; Used to skip the AppRun shell script when patching executables.
+         (define (elf-file? path)
+           (let* ((port (open-file path "rb"))
+                  (b0 (read-char port))
+                  (b1 (read-char port))
+                  (b2 (read-char port))
+                  (b3 (read-char port)))
+             (close-port port)
+             (and (char? b0) (char? b1) (char? b2) (char? b3)
+                  (= (char->integer b0) #x7f)
+                  (char=? b1 #\E) (char=? b2 #\L) (char=? b3 #\F))))
+
          (let* ((out        (assoc-ref %outputs "out"))
                 (share      (string-append out "/share/tuta"))
                 (bin        (string-append out "/bin"))
@@ -144,11 +157,19 @@
              (unless elf-binary
                (error "Could not locate main Electron binary in extracted AppImage"))
 
-             (format #t "Patching ELF: ~a~%" elf-binary)
-
-             ;; Patch the bundled Electron runtime to use Guix's loader and libs
-             (invoke patchelf "--set-interpreter" loader elf-binary)
-             (invoke patchelf "--set-rpath" rpath elf-binary)
+             ;; Patch every top-level ELF executable to use Guix's loader and
+             ;; RPATH.  This covers the main Electron binary AND the helper
+             ;; executables Electron spawns as separate processes
+             ;; (chrome_crashpad_handler, chrome-sandbox) which otherwise keep
+             ;; the upstream "/lib64/ld-linux-x86-64.so.2" interpreter that does
+             ;; not exist on Guix.  The AppRun shell script is skipped by elf-file?.
+             (for-each
+              (lambda (f)
+                (when (elf-file? f)
+                  (format #t "Patching ELF: ~a~%" f)
+                  (invoke patchelf "--set-interpreter" loader f)
+                  (invoke patchelf "--set-rpath" rpath f)))
+              top-level-execs)
 
              ;; Write launcher script
              (let ((launcher (string-append bin "/tuta")))
