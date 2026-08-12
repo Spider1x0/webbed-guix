@@ -10,6 +10,9 @@
   #:use-module (gnu packages xdisorg)
   #:use-module (gnu packages wm))
 
+;;; xmonad-river — mgsloan's xmonad-on-river fork of xmonad
+;;; xmonad-contrib-river — mgsloan's xmonad-on-river fork of xmonad-contrib
+
 (define-public ghc-store-core
   (package
     (name "ghc-store-core")
@@ -63,3 +66,34 @@ compositor.  Implements the same core XMonad API as a strict subset of upstream
 XMonad — names absent from the API fail at compile time rather than silently
 doing nothing.  No X11 dependencies; communicates with River directly via
 Wayland protocols and Unix sockets.")))
+
+(define-public ghc-xmonad-contrib-river
+  (package
+    (inherit ghc-xmonad-contrib)
+    (name "ghc-xmonad-contrib-river")
+    (version "0.18.2.9")
+    (source
+     (origin
+       (method git-fetch)
+       (uri (git-reference
+              (url "https://github.com/mgsloan/xmonad-contrib")
+              (commit "24a21fb037ca0a291ac62ffec6566279e78574df")))
+       (file-name (git-file-name "xmonad-contrib-river" version))
+       (sha256
+        (base32 "03v0hj7s455gxad9a4yhkb55p1xn7wzypixkmf5y0fgh9293sl7k"))))
+    ;; Disable the use_xft flag: X11-xft is not needed for the River backend.
+    (arguments `(#:configure-flags '("--flags=-use_xft")))
+    (inputs (list xmonad-river
+                  ghc-random
+                  ghc-utf8-string
+                  ghc-cairo
+                  ghc-pango))
+    (native-inputs (list ghc-quickcheck ghc-hspec))
+    (properties '())
+    (home-page "https://github.com/mgsloan/xmonad-contrib/tree/xmonad-on-river")
+    (synopsis "XMonad contrib extensions for the River Wayland compositor")
+    (description
+     "Third-party extensions for @code{xmonad-river}, the XMonad port targeting
+the River Wayland compositor.  Provides layouts, hooks, and utilities adapted
+from upstream xmonad-contrib, with X11-specific modules removed or ported to
+the River/Wayland API.")))
