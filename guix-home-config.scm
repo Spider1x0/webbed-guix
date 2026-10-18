@@ -11,10 +11,32 @@
   #:use-module (gnu home services desktop)
   #:use-module (gnu home services sound)
   #:use-module (gnu home services syncthing)
-  #:use-module (gnu system shadow))
+  #:use-module (gnu system shadow)
+  #:use-module (gnu packages bash)
+  #:use-module (gnu packages nushell)
+  #:use-module (packages carapace)
+  #:use-module (guix gexp))
+
+;; Nushell is NOT the login shell: it isn't POSIX, and Guix (profile
+;; scripts, setup-environment, `guix shell`) expects a POSIX login shell.
+;; Bash stays the login shell; launch nu through this wrapper instead (e.g.
+;; as the terminal's command).  The `-l` shebang makes bash a login shell,
+;; so /etc/profile and .bash_profile set up the Guix environment first; nu
+;; then inherits it via exec.
+(define nu-login
+  (computed-file "nu-login"
+    #~(begin
+        (call-with-output-file #$output
+          (lambda (port)
+            (format port "#!~a/bin/bash -l~%exec ~a/bin/nu \"$@\"~%"
+                    #$bash #$nushell)))
+        (chmod #$output #o555))))
 
 (define home-config
   (home-environment
+    ;; carapace-bin ships share/nushell/vendor/autoload/carapace.nu, which
+    ;; nu loads from the home profile automatically: no config.nu edits.
+    (packages (list nushell carapace-bin))
     (services
       (append
         (list
@@ -38,7 +60,8 @@
           ;(service home-zsh-service-type)
 
           (service home-files-service-type
-           `((".guile" ,%default-dotguile)
+           `((".local/bin/nu-login" ,nu-login)
+             (".guile" ,%default-dotguile)
              (".Xdefaults" ,%default-xdefaults)))
 
           (service home-xdg-configuration-files-service-type
