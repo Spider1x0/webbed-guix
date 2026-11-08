@@ -1,6 +1,7 @@
 (define-module (packages xmonad-river)
   #:use-module (guix packages)
   #:use-module (guix download)
+  #:use-module (guix gexp)
   #:use-module (guix git-download)
   #:use-module (guix build-system haskell)
   #:use-module ((guix licenses) #:prefix license:)
@@ -46,7 +47,12 @@ providing fast serialization via unsafe memory operations.")
               (commit "dec3b72d726c766dfeba2a605f51e52073d96538")))
        (file-name (git-file-name "xmonad-river" version))
        (sha256
-        (base32 "1vgb3qn02493p3xkfb6xd3gnqmsxkdw7952xv74s4n22a7gd5ggq"))))
+        (base32 "1vgb3qn02493p3xkfb6xd3gnqmsxkdw7952xv74s4n22a7gd5ggq"))
+       ;; Local fixes, developed in ~/.local/dev/xmonad-river: content clip at
+       ;; screen edges, click to focus (window_interaction), pointer_enter only
+       ;; on real pointer motion, rescreen keyed on screen id, placements inset
+       ;; by border width, title-change events, close-on-exec Wayland sockets.
+       (patches (list (local-file "../patches/xmonad-river-backend.patch")))))
     ;; Tests require a live River compositor; disable in the Guix sandbox.
     (arguments (list #:tests? #f))
     (inputs (list ghc-data-default-class

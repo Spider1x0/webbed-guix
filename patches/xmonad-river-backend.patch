@@ -1,0 +1,323 @@
+diff --git a/src/XMonad/River/Connection.hs b/src/XMonad/River/Connection.hs
+index 132c677..82171ff 100644
+--- a/src/XMonad/River/Connection.hs
++++ b/src/XMonad/River/Connection.hs
+@@ -56,7 +56,7 @@ import qualified Network.Socket.ByteString as NBS
+ 
+ import Data.Store.Core (Peek)
+ 
+-import System.Posix.IO (closeFd)
++import System.Posix.IO (FdOption(CloseOnExec), closeFd, setFdOption)
+ import System.Posix.Types (Fd)
+ 
+ import XMonad.River.Socket (recvWithFds, sendWithFds)
+@@ -149,6 +149,11 @@ connectTo path = do
+ 
+ newConnection :: N.Socket -> IO Connection
+ newConnection sock = do
++  -- Close-on-exec, or every program the window manager spawns inherits the
++  -- connection, and after the window manager dies (crash, kill) those children
++  -- keep its river_window_manager_v1 alive: river then refuses the restarted
++  -- one with "another window manager is already running".
++  N.withFdSocket sock $ \fd -> setFdOption (fromIntegral fd) CloseOnExec True
+   -- Client ids start at 2; 1 is wl_display.
+   nextId    <- newIORef 2
+   freeIds   <- newIORef []
+diff --git a/src/XMonad/River/Plan.hs b/src/XMonad/River/Plan.hs
+index 5f30fbe..99e9a99 100644
+--- a/src/XMonad/River/Plan.hs
++++ b/src/XMonad/River/Plan.hs
+@@ -23,6 +23,7 @@ module XMonad.River.Plan
+   ) where
+ 
+ import Data.ByteString (ByteString)
++import Data.Int (Int32)
+ import Data.Word (Word32)
+ import qualified Data.Map.Strict as M
+ import qualified Data.Set as S
+@@ -51,6 +52,12 @@ data Plan = Plan
+     -- ^ Width and RGBA per placed window, already resolved against any
+     -- per-window override.  Borders are rendering state, so river forgets them
+     -- between frames and they have to be restated rather than set once.
++  , planClips      :: !(M.Map Window (Int32, Int32, Int32, Int32))
++    -- ^ Content clip box (x, y, width, height, relative to the window's own
++    -- origin) for each tiled window that its layout placed partly off its
++    -- screen.  Without it a window half scrolled off one monitor is drawn on
++    -- the neighbouring one.  Absent means unclipped, which is restated as a
++    -- zero box every frame, so a window that scrolls back loses its clip.
+   , planVisible    :: !(S.Set Window)
+     -- ^ What the layout placed.  Anything river knows about and this does not
+     -- contain belongs to a workspace that is off screen, and is hidden --
+@@ -80,6 +87,7 @@ emptyPlan = Plan
+   { planSerial     = 0
+   , planPlacements = []
+   , planBorders    = M.empty
++  , planClips      = M.empty
+   , planVisible    = S.empty
+   , planRaised     = []
+   , planFocus      = ClearFocus
+diff --git a/src/XMonad/River/WM.hs b/src/XMonad/River/WM.hs
+index b87e9f4..a6442a6 100644
+--- a/src/XMonad/River/WM.hs
++++ b/src/XMonad/River/WM.hs
+@@ -141,6 +141,15 @@ data Runtime = Runtime
+     -- a queued action would be too late: queueing at all asks river for a
+     -- manage sequence, so a config with this off would pay for one on every
+     -- pointer crossing.  Safe to snapshot: it cannot change without a restart.
++  , rtPointerMoved :: !(IORef Bool)
++    -- ^ A @pointer_position@ with a new position arrived since the last
++    -- @manage_start@.  river sends that event only when the pointer moved, so
++    -- this is what tells a crossing the user made from one caused by a window
++    -- arriving under a pointer at rest.
++  , rtMovedThisSeq :: !(IORef Bool)
++    -- ^ 'rtPointerMoved' as it stood when this sequence started, snapshotted
++    -- on the loop before the worker runs, so the queued focus action reads a
++    -- value the next batch of events cannot change under it.
+   , rtStartupDone :: !(IORef Bool)
+   , rtRestored    :: !(IORef Bool)
+     -- ^ Whether the state file left by a previous window manager has been read
+@@ -244,6 +253,8 @@ run conn manager bindings bindingsVer layerShell compositor shm userConfig dirs
+           <*> pure (focusFollowsMouse userConfig)
+           <*> newIORef False
+           <*> newIORef False
++          <*> newIORef False
++          <*> newIORef False
+           <*> pure layerShell
+           <*> newIORef Nothing
+ 
+@@ -507,6 +518,7 @@ onManagerEvent conn manager restartRef rt submit tick = \case
+     Just (prog, as) -> executeFile prog True as Nothing
+   RiverWindowManagerV1ManageStart -> do
+     before <- planSerial <$> readIORef (rtPlan rt)
++    writeIORef (rtMovedThisSeq rt) =<< atomicModifyIORef' (rtPointerMoved rt) (\m -> (False, m))
+     submit (manageSequence rt)
+     -- Bounded.  An action that finishes in time has its result in this
+     -- sequence, exactly as when the loop ran it itself; one that overruns
+@@ -601,7 +613,12 @@ addWindow rt conn win = do
+   riverWindowV1Listen conn win $ \case
+     RiverWindowV1Closed        -> adjust ref win $ \w -> w { rwClosed = True }
+     RiverWindowV1AppId a       -> adjust ref win $ \w -> w { rwAppId = a }
+-    RiverWindowV1Title t       -> adjust ref win $ \w -> w { rwTitle = t }
++    -- Announced as well as recorded, as X11 announced a WM_NAME PropertyNotify:
++    -- otherwise a status feed only learns a title when something else
++    -- happens to run the log hook.
++    RiverWindowV1Title t       -> do
++      adjust ref win $ \w -> w { rwTitle = t }
++      queueAction rt $ void $ broadcastEvent (WindowTitleChanged win t)
+     RiverWindowV1UnreliablePid p -> adjust ref win $ \w -> w { rwPid = Just p }
+     RiverWindowV1Identifier i  -> adjust ref win $ \w -> w { rwIdentifier = Just i }
+     RiverWindowV1Parent p      -> adjust ref win $ \w ->
+@@ -727,11 +744,33 @@ addSeat rt conn seat = do
+         -- in progress owns the focus outright: X11 held a pointer grab for
+         -- the duration, which suppressed crossing events entirely, and there
+         -- is no grab here to do it.
++        --
++        -- And the pointer must have moved in this sequence: river also sends
++        -- @pointer_enter@ when a window is placed under a pointer at rest,
++        -- and following that lets any layout that moves windows by itself --
++        -- a scrolling one most of all -- hand focus to whatever it just slid
++        -- under the cursor.
+         stillThere <- io ((== Just win) <$> readIORef (rtHovered rt))
++        moved <- io (readIORef (rtMovedThisSeq rt))
+         drag <- gets dragging
+-        when (stillThere && isNothing drag) (focus win)
++        when (stillThere && moved && isNothing drag) (focus win)
+     RiverSeatV1PointerLeave -> writeIORef (rtHovered rt) Nothing
+-    RiverSeatV1PointerPosition x y ->
++    -- A press (or touch) on a window: click to focus, X11's ButtonPress on a
++    -- client.  Not gated on 'focusFollowsMouse': a config that turns that off
++    -- still needs the mouse to choose a window.  It matters for any layout
++    -- that moves windows on its own, because river sends @pointer_enter@
++    -- whenever a window arrives under a pointer that has not moved, not only
++    -- for "genuine pointer movement" as the comment above assumes, so focus
++    -- following the mouse lets a scrolling layout's viewport steal focus.
++    -- 'focus' also makes the window's screen current, which is how a click
++    -- moves xmonad to the other monitor.
++    RiverSeatV1WindowInteraction win -> queueAction rt $ do
++      drag <- gets dragging
++      when (isNothing drag) (focus win)
++    RiverSeatV1PointerPosition x y -> do
++      seats <- readIORef ref
++      when (fmap rsPointer (M.lookup seat seats) /= Just (x, y)) $
++        writeIORef (rtPointerMoved rt) True
+       adjust ref seat $ \s -> s { rsPointer = (x, y) }
+     -- A surface this window manager drew was pressed.  X11 delivered that as a
+     -- ButtonPress on the decoration window and river will not: a decoration is
+@@ -948,7 +987,10 @@ syncScreens = do
+                 _ -> Rectangle x y (fromIntegral width) (fromIntegral height)
+         ]
+   unless (null rects) $ do
+-    before <- gets (map (screenRect . W.screenDetail) . screensOf . windowset)
++    -- In screen-id order, as @rects@ is: current-first would differ from
++    -- @rects@ whenever the second monitor has focus, and announce a layout
++    -- change on every sequence.
++    before <- gets (map (screenRect . W.screenDetail) . sortOn W.screen . screensOf . windowset)
+     modify $ \st -> st { windowset = rescreen rects (windowset st) }
+     -- Only when it actually changed.  A manage sequence runs for all sorts of
+     -- reasons and most of them leave the outputs alone; a config restarting
+@@ -961,25 +1003,40 @@ screensOf ws = W.current ws : W.visible ws
+ 
+ -- | Lay the given screen rectangles over the current workspaces, preserving
+ -- which workspace is on which screen where possible.
++--
++-- Keyed on screen id, and leaving the current screen current.  This runs at
++-- the start of every manage sequence, not only when outputs change the way
++-- xinerama's @rescreen@ did, so it has to be the identity when nothing has
++-- changed.  It used to rebuild the screens positionally with the current
++-- workspace always on screen 0: after focusing the second monitor, the next
++-- sequence -- the next click or key -- swapped the two monitors' workspaces
++-- and focus "jumped back" to the first.
+ rescreen :: [Rectangle] -> WindowSet -> WindowSet
+-rescreen rects ws = ws
+-    { W.current = (W.current ws) { W.screen = 0, W.screenDetail = SD firstRect }
+-    , W.visible = zipWith reseat [1 ..] restRects
+-    , W.hidden = newHidden
+-    }
++rescreen rects ws = case (keepCur, placed) of
++    (Just c, _)  -> ws { W.current = c, W.visible = others (sid c), W.hidden = hidden' }
++    (Nothing, c:_) -> ws { W.current = c, W.visible = others (sid c), W.hidden = hidden' }
++    (Nothing, []) -> ws
+   where
+-    (firstRect, restRects) = case rects of
+-      (r:rs) -> (r, rs)
+-      []     -> (Rectangle 0 0 0 0, [])
++    sid :: W.Screen i l a ScreenId sd -> Int
++    sid = fromIntegral . W.screen
++    n = length rects
++    old = W.current ws : W.visible ws
++    byId = M.fromList [ (sid s, s) | s <- old ]
+     -- Workspaces that were on now-absent screens fall back to hidden.
+-    oldVisible = W.visible ws
+-    reseat i r = case drop (i - 1) oldVisible of
+-      (s:_) -> s { W.screen = fromIntegral i, W.screenDetail = SD r }
+-      [] -> case newHidden of
+-        (h:_) -> W.Screen h (fromIntegral i) (SD r)
+-        []    -> W.Screen (W.workspace (W.current ws)) (fromIntegral i) (SD r)
+-    surplus = drop (length restRects) oldVisible
+-    newHidden = map W.workspace surplus ++ W.hidden ws
++    dropped = [ W.workspace s | s <- old, sid s >= n ]
++    (fresh, hidden') = fill [ (i, r) | (i, r) <- zip [0 ..] rects, M.notMember i byId ]
++                            (dropped ++ W.hidden ws)
++    kept = [ s { W.screenDetail = SD r } | (i, r) <- zip [0 ..] rects, Just s <- [M.lookup i byId] ]
++    placed = sortOn sid (kept ++ fresh)
++    keepCur = case filter ((== sid (W.current ws)) . sid) placed of
++      (c:_) | sid (W.current ws) < n -> Just c
++      _ -> Nothing
++    others i = filter ((/= i) . sid) placed
++    -- A new screen takes the first hidden workspace; with none left it is
++    -- not given one rather than showing a workspace twice.
++    fill ((i, r) : rest) (h : hs) = let (ss, left) = fill rest hs
++                                    in (W.Screen h (fromIntegral i) (SD r) : ss, left)
++    fill _ hs = ([], hs)
+ 
+ -- | Run the manage hook for windows river has just told us about, and insert
+ -- them into the 'WindowSet'.
+@@ -1192,7 +1249,7 @@ applyLayout :: Runtime -> X ()
+ applyLayout rt = do
+   ws <- gets windowset
+   let screens = W.current ws : W.visible ws
+-  placements <- fmap concat $ forM screens $ \scr -> do
++  perScreen <- forM screens $ \scr -> do
+     let wsp = W.workspace scr
+         SD rect = W.screenDetail scr
+         -- The floating layer, as upstream's 'windows' handles it.  Floats are
+@@ -1213,8 +1270,11 @@ applyLayout rt = do
+       st { windowset = updateLayout (W.tag wsp) l' (windowset st) }
+     -- Floats last, because the render sequence place_tops this list in order,
+     -- so later is higher.  Upstream expresses the same thing the other way
+-    -- round and then restacks.
+-    pure (rs ++ flt)
++    -- round and then restacks.  Only tiled windows are clipped: a float is
++    -- where the user put it, straddling monitors included.
++    pure (rs ++ flt, [ (w, (rect, r)) | (w, r) <- rs ])
++  let placements = concatMap fst perScreen
++      tiledOn = concatMap snd perScreen
+ 
+   -- Borders are resolved here rather than while transmitting, because the
+   -- override lookup and the focused/normal choice are decisions and belong
+@@ -1232,7 +1292,25 @@ applyLayout rt = do
+           Nothing -> pixelColor (if Just win == mFocus then focusedCol else normalCol)
+     pure (win, (width, rgba))
+ 
+-  raised <- io . readIORef =<< asks (riverRestack . riverState)
++  -- What river is told is the window /content/: its position and dimensions
++  -- exclude borders, which it draws outside them.  A layout's rectangle is
++  -- the whole tile, border included, as it was under X11, so the content is
++  -- that rectangle inset by the border on every side -- X11 xmonad's
++  -- @tileWindow@ did the same subtraction.  Without it every border overhung
++  -- its tile: neighbours overlapped by a border's width, and a window at a
++  -- monitor edge spilled that much onto the next monitor.
++  --
++  -- The clip is taken against the screen inset the same way, because river
++  -- draws the border around the clipped content: so the border at a cut edge
++  -- ends exactly on the screen edge instead of past it.
++  let bwOf w = maybe 0 fst (M.lookup w borders)
++      content = [ (w, insetBy (bwOf w) r) | (w, r) <- placements ]
++      clips = M.fromList
++        [ (w, c) | (w, (scr, r)) <- tiledOn
++                 , let b = bwOf w
++                 , Just c <- [contentClip (insetBy b scr) (insetBy b r)] ]
++
++  raised <-io . readIORef =<< asks (riverRestack . riverState)
+   let placed = S.fromList (map fst placements)
+       stillUp = filter (`S.member` placed) raised
+   io . flip writeIORef stillUp =<< asks (riverRestack . riverState)
+@@ -1245,8 +1323,9 @@ applyLayout rt = do
+ 
+   io $ modifyIORef' (rtPlan rt) $ \p -> p
+     { planSerial     = planSerial p + 1
+-    , planPlacements = placements
++    , planPlacements = content
+     , planBorders    = borders
++    , planClips      = clips
+     , planVisible    = placed
+     , planRaised     = stillUp
+     , planFocus      = maybe ClearFocus FocusWindow mFocus
+@@ -1500,6 +1579,12 @@ transmitRender rt conn = do
+           M.findWithDefault (0, (0, 0, 0, 0)) win (planBorders plan)
+     riverWindowV1SetBorders conn win allEdges (fromIntegral width)
+       red green blue alpha
++    -- The content clip rather than set_clip_box, so river draws the border
++    -- around what is left visible and the cut edge is framed like any other.
++    -- A zero box disables clipping, which is what a window entirely on its
++    -- screen is sent.
++    let (cx, cy, cw, ch) = M.findWithDefault (0, 0, 0, 0) win (planClips plan)
++    riverWindowV1SetContentClipBox conn win cx cy cw ch
+     when (rwHidden w) $ do
+       riverWindowV1Show conn win
+       adjust winRef win $ \x -> x { rwHidden = False }
+@@ -1520,6 +1605,34 @@ transmitRender rt conn = do
+   forM_ (planRaised plan) $ \win ->
+     forM_ (M.lookup win known) $ \w -> riverNodeV1PlaceTop conn (rwNode w)
+ 
++-- | A rectangle shrunk by a border width on every side, never below 1x1.
++insetBy :: Dimension -> Rectangle -> Rectangle
++insetBy b (Rectangle x y w h) =
++  Rectangle (x + fromIntegral b) (y + fromIntegral b) (shrink w) (shrink h)
++  where shrink d = if d > 2 * b then d - 2 * b else 1
++
++-- | The part of a window's rectangle that lies on its screen, relative to the
++-- window's origin, when that is less than all of it.
++--
++-- 'Nothing' for a window wholly on screen (no clip needed) and for one wholly
++-- off it, which a layout should not have placed and which a zero-sized box
++-- could not express anyway -- river reads zero as "no clipping".
++contentClip :: Rectangle -> Rectangle -> Maybe (Int32, Int32, Int32, Int32)
++contentClip (Rectangle sx sy sw sh) (Rectangle wx wy ww wh)
++  | cw <= 0 || ch <= 0 = Nothing
++  | cw == w && ch == h = Nothing
++  | otherwise = Just (fromIntegral (x0 - x), fromIntegral (y0 - y), fromIntegral cw, fromIntegral ch)
++  where
++    -- Int, because Position + Dimension in Int32 overflows for no good reason.
++    i :: Integral n => n -> Int
++    i = fromIntegral
++    (x, y, w, h) = (i wx, i wy, i ww, i wh)
++    (scx, scy, scw, sch) = (i sx, i sy, i sw, i sh)
++    x0 = max x scx
++    y0 = max y scy
++    cw = min (x + w) (scx + scw) - x0
++    ch = min (y + h) (scy + sch) - y0
++
+ -- | A dimension bound river reports as zero or less was not stated.
+ sizeBound :: Int32 -> Int32 -> Maybe (Dimension, Dimension)
+ sizeBound w h
